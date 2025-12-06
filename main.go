@@ -29,14 +29,13 @@ import (
 
 // ================== Config Struct ==================
 type Config struct {
-	EmbyServer   string    `yaml:"emby_server"`
-	LogLevel     string    `yaml:"log_level"`
-	EmbyApiKey   string    `yaml:"emby_api_key"`
-	Hide         []string  `yaml:"hide"`
-	Library      []Library `yaml:"library"`
-	VirtualInsert string   `yaml:"virtual_insert"` // prepend | append | index:<n> | after_type:<type>
-
-	ViewsOrder []ViewOrderItem `yaml:"views_order"` // 全序控制：优先级高于 VirtualInsert
+	EmbyServer    string    `yaml:"emby_server"`
+	LogLevel      string    `yaml:"log_level"`
+	EmbyApiKey    string    `yaml:"emby_api_key"`
+	Hide          []string  `yaml:"hide"`
+	Library       []Library `yaml:"library"`
+	VirtualInsert string    `yaml:"virtual_insert"` // prepend | append | index:<n> | after_type:<type>
+	ViewsOrder    []ViewOrderItem `yaml:"views_order"` // 全序控制：优先于 VirtualInsert
 }
 
 type ViewOrderItem struct {
@@ -78,14 +77,14 @@ func (l *Library) GetParamKey() string {
 var config Config
 var libraryMap = map[string]Library{}
 
-// 可选 /emby 前缀的正则
+// 可选 /emby 前缀 + 可选 Users 段的正则
 var (
 	pathPrefix        = `(?:/emby)?`
 	hookViewsRe       = regexp.MustCompile(pathPrefix + `/Users/[^/]+/Views$`)
-	hookLatestRe      = regexp.MustCompile(pathPrefix + `/Users/[^/]+/Items/Latest$`)
-	hookDetailsRe     = regexp.MustCompile(pathPrefix + `/Users/[^/]+/Items$`)
-	hookDetailIntroRe = regexp.MustCompile(pathPrefix + `/Users/[^/]+/Items/\d+$`)
-	hookImageRe       = regexp.MustCompile(pathPrefix + `/Items/\d+/Images/(?:P|p)rimary$`)
+	hookLatestRe      = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/Latest$`)
+	hookDetailsRe     = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items$`)
+	hookDetailIntroRe = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/\d+$`)
+	hookImageRe       = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/\d+/Images/(?:P|p)rimary$`)
 )
 
 type ResponseHook struct {
@@ -124,21 +123,24 @@ func HashNameToID(name string) string {
 	return strconv.FormatUint(uint64(h.Sum32()), 10)
 }
 
-// 获取 userId
+// 获取 userId（支持 /emby/Users/{uid}/... 或 /emby/Items?...&UserId=xxx）
 func getUserId(req *http.Request) string {
 	path := req.URL.Path
 	parts := strings.Split(path, "/")
 	userId := ""
-	if len(parts) <= 1 {
-		return userId
-	}
-	if parts[1] == "emby" {
-		if len(parts) > 3 {
+
+	if len(parts) > 1 && parts[1] == "emby" {
+		if len(parts) > 3 && parts[2] == "Users" {
 			userId = parts[3]
 		}
 	} else {
-		if len(parts) > 2 {
+		if len(parts) > 2 && parts[1] == "Users" {
 			userId = parts[2]
+		}
+	}
+	if userId == "" {
+		if v := req.URL.Query().Get("UserId"); v != "" {
+			userId = v
 		}
 	}
 	return userId
@@ -186,8 +188,8 @@ func doGetJSON(
 	return data, nil
 }
 
-// 优化 X-Emby 参数处理（以 Header 透传为主）
-func setXEmbyParams(query, originalQuery url.Values, headers http.Header, originalHeaders http.Header) {
+// 仅通过 Header 透传 X-Emby-*（query 不塞）
+func setXEmbyParams(_ url.Values, originalQuery url.Values, headers http.Header, originalHeaders http.Header) {
 	xEmbyKeys := []string{
 		"X-Emby-Client",
 		"X-Emby-Device-Name",
@@ -197,12 +199,12 @@ func setXEmbyParams(query, originalQuery url.Values, headers http.Header, origin
 		"X-Emby-Language",
 		"X-Emby-Authorization",
 	}
+	_ = originalQuery
 	for _, key := range xEmbyKeys {
 		if headerVal := originalHeaders.Get(key); headerVal != "" {
 			headers.Set(key, headerVal)
 		}
 	}
-	// 注意：query 侧不再塞 X-Emby-*；Emby 识别的是 header 或 api_key
 }
 
 func getAllCollections(boxId string, orignalReq *http.Request) []map[string]interface{} {
@@ -299,8 +301,7 @@ func getCollectionDataWithApi(lib Library, apiKey string) map[string]interface{}
 	}
 	query.Set("Fields", "BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate")
 	query.Set("EnableTotalRecordCount", "true")
-	// Emby 识别的是 api_key（小写）
-	query.Set("api_key", apiKey)
+	query.Set("api_key", apiKey) // 小写
 
 	url := fmt.Sprintf("%s/emby/Items", config.EmbyServer)
 	headers := http.Header{}
@@ -432,14 +433,15 @@ func replaceBody(resp *http.Response, bodyBytes []byte) error {
 // =============== image hook ===============
 func hookImage(resp *http.Response) error {
 	log.Debug("hookImage")
-	// get tag
+	// 先取 ?tag / ?Tag；没有就从路径中提取 Items/{id}/Images/Primary 的 {id}
 	tag := resp.Request.URL.Query().Get("tag")
 	if tag == "" {
 		tag = resp.Request.URL.Query().Get("Tag")
 	}
 	if tag == "" {
 		components := strings.Split(resp.Request.URL.Path, "/")
-		// /emby/Items/2122802865/Images/Primary
+		// /emby/Items/{id}/Images/Primary 或 /emby/Users/{uid}/Items/{id}/Images/Primary
+		// 倒数第三段是 {id}
 		if len(components) >= 3 {
 			tag = components[len(components)-3]
 		}
@@ -461,11 +463,9 @@ func hookImage(resp *http.Response) error {
 			return err
 		}
 		image = userImage
-		// 设置缓存响应头
 		resp.Header.Set("Cache-Control", "public, max-age=86400")
 	} else {
 		path := fmt.Sprintf("images/%s.png", lib.Name)
-		// check if file exists
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			placeholder, err := os.ReadFile("assets/placeholder.png")
 			if err != nil {
@@ -518,7 +518,7 @@ func hookDetailIntro(resp *http.Response) error {
     "ProviderIds": {},
     "IsFolder": true,
     "ParentId": "1",
-    "Type": "CollectionFolder",
+    "Type": "UserView",
     "UserData": {
         "PlaybackPositionTicks": 0,
         "IsFavorite": false,
@@ -585,9 +585,12 @@ func hookDetails(resp *http.Response) error {
 	parentId := resp.Request.URL.Query().Get("ParentId")
 	lib, ok := libraryMap[parentId]
 	if !ok {
-		// 某些客户端用 Users/{id}/Items 直接取视图，兜底走 hookViews
+		// 某些客户端用 Items 直接取视图，兜底走 hookViews
 		hasId := false
 		for key := range resp.Request.URL.Query() {
+			if key == "UserId" {
+				continue
+			}
 			if strings.HasSuffix(key, "Id") {
 				hasId = true
 				break
@@ -688,7 +691,7 @@ func hookViews(resp *http.Response) error {
 		"ServerId": "",
 		"SortName": "Sample Library",
 		"Taglines": [],
-		"Type": "CollectionFolder",
+		"Type": "UserView",
 		"UserData": {
 			"IsFavorite": false,
 			"PlaybackPositionTicks": 0,
@@ -1009,7 +1012,6 @@ func getImage(lib *Library) error {
 	if itemCount <= 9 {
 		selected = items
 	} else {
-		// 洗牌
 		rand.Shuffle(itemCount, func(i, j int) { items[i], items[j] = items[j], items[i] })
 		selected = items[:9]
 	}
