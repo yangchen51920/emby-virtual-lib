@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,20 +30,15 @@ import (
 
 // ================== Config Struct ==================
 type Config struct {
-	EmbyServer    string    `yaml:"emby_server"`
-	LogLevel      string    `yaml:"log_level"`
-	EmbyApiKey    string    `yaml:"emby_api_key"`
-	Hide          []string  `yaml:"hide"`
-	Library       []Library `yaml:"library"`
-	VirtualInsert string    `yaml:"virtual_insert"` // prepend | append | index:<n> | after_type:<type>
-	ViewsOrder    []ViewOrderItem `yaml:"views_order"` // 全序控制：优先于 VirtualInsert
-}
+	EmbyServer string    `yaml:"emby_server"`
+	LogLevel   string    `yaml:"log_level"`
+	EmbyApiKey string    `yaml:"emby_api_key"`
+	Hide       []string  `yaml:"hide"`
+	Library    []Library `yaml:"library"`
 
-type ViewOrderItem struct {
-	Virtual  string `yaml:"virtual,omitempty"`   // 虚拟库名称（config.Library[].Name）
-	RealType string `yaml:"real_type,omitempty"` // 真实库 CollectionType（movies/tvshows/music/photos/boxsets/...）
-	RealName string `yaml:"real_name,omitempty"` // 真实库显示名
-	RealID   string `yaml:"real_id,omitempty"`   // 真实库 Id
+	// 新增：首页视图排序，按 Name 匹配
+	// 不配置时保持原来行为
+	ViewsOrder []string `yaml:"views_order"`
 }
 
 type Library struct {
@@ -77,14 +73,12 @@ func (l *Library) GetParamKey() string {
 var config Config
 var libraryMap = map[string]Library{}
 
-// 可选 /emby 前缀 + 可选 Users 段的正则
 var (
-	pathPrefix        = `(?:/emby)?`
-	hookViewsRe       = regexp.MustCompile(pathPrefix + `/Users/[^/]+/Views$`)
-	hookLatestRe      = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/Latest$`)
-	hookDetailsRe     = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items$`)
-	hookDetailIntroRe = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/\d+$`)
-	hookImageRe       = regexp.MustCompile(pathPrefix + `/(?:Users/[^/]+/)?Items/\d+/Images/(?:P|p)rimary$`)
+	hookViewsRe       = regexp.MustCompile(`/Users/[^/]+/Views$`)
+	hookLatestRe      = regexp.MustCompile(`/Users/[^/]+/Items/Latest$`)
+	hookDetailsRe     = regexp.MustCompile(`/Users/[^/]+/Items$`)
+	hookDetailIntroRe = regexp.MustCompile(`/Users/[^/]+/Items/\d+$`)
+	hookImageRe       = regexp.MustCompile(`/Items/\d+/Images/(P|p)rimary$`)
 )
 
 type ResponseHook struct {
@@ -123,24 +117,21 @@ func HashNameToID(name string) string {
 	return strconv.FormatUint(uint64(h.Sum32()), 10)
 }
 
-// 获取 userId（支持 /emby/Users/{uid}/... 或 /emby/Items?...&UserId=xxx）
+// 获取 userId
 func getUserId(req *http.Request) string {
 	path := req.URL.Path
 	parts := strings.Split(path, "/")
 	userId := ""
-
-	if len(parts) > 1 && parts[1] == "emby" {
-		if len(parts) > 3 && parts[2] == "Users" {
+	if len(parts) < 3 {
+		return userId
+	}
+	if parts[1] == "emby" {
+		if len(parts) > 3 {
 			userId = parts[3]
 		}
 	} else {
-		if len(parts) > 2 && parts[1] == "Users" {
+		if len(parts) > 2 {
 			userId = parts[2]
-		}
-	}
-	if userId == "" {
-		if v := req.URL.Query().Get("UserId"); v != "" {
-			userId = v
 		}
 	}
 	return userId
@@ -151,14 +142,14 @@ func embyURL(path string, userId string) string {
 	return config.EmbyServer + strings.Replace(path, "{userId}", userId, 1)
 }
 
-// 通用 GET 请求并解析 JSON（带超时）
+// 通用 GET 请求并解析 JSON
 func doGetJSON(
 	baseURL string,
 	query url.Values,
 	headers http.Header,
 	cookies []*http.Cookie,
 ) (map[string]interface{}, error) {
-	client := &http.Client{Timeout: 12 * time.Second}
+	client := &http.Client{}
 	req, err := http.NewRequest("GET", baseURL, nil)
 	if err != nil {
 		return nil, err
@@ -166,11 +157,9 @@ func doGetJSON(
 	if query != nil {
 		req.URL.RawQuery = query.Encode()
 	}
-	if headers != nil {
-		for k, v := range headers {
-			for _, vv := range v {
-				req.Header.Add(k, vv)
-			}
+	for k, v := range headers {
+		for _, vv := range v {
+			req.Header.Add(k, vv)
 		}
 	}
 	for _, c := range cookies {
@@ -188,20 +177,16 @@ func doGetJSON(
 	return data, nil
 }
 
-// 仅通过 Header 透传 X-Emby-*（query 不塞）
-func setXEmbyParams(_ url.Values, originalQuery url.Values, headers http.Header, originalHeaders http.Header) {
-	xEmbyKeys := []string{
-		"X-Emby-Client",
-		"X-Emby-Device-Name",
-		"X-Emby-Device-Id",
-		"X-Emby-Client-Version",
-		"X-Emby-Token",
-		"X-Emby-Language",
-		"X-Emby-Authorization",
-	}
-	_ = originalQuery
+// 优化 X-Emby 参数处理，优先 originalQuery，其次 header，最后 query
+func setXEmbyParams(query, originalQuery url.Values, headers http.Header, originalHeaders http.Header) {
+	xEmbyKeys := []string{"X-Emby-Client", "X-Emby-Device-Name", "X-Emby-Device-Id", "X-Emby-Client-Version", "X-Emby-Token", "X-Emby-Language", "X-Emby-Authorization"}
 	for _, key := range xEmbyKeys {
-		if headerVal := originalHeaders.Get(key); headerVal != "" {
+		val := originalQuery.Get(key)
+		if val != "" {
+			query.Set(key, val)
+		}
+		headerVal := originalHeaders.Get(key)
+		if headerVal != "" {
 			headers.Set(key, headerVal)
 		}
 	}
@@ -227,9 +212,12 @@ func getAllCollections(boxId string, orignalReq *http.Request) []map[string]inte
 	if err != nil {
 		return nil
 	}
+	itemsRaw, ok := data["Items"].([]interface{})
+	if !ok {
+		return nil
+	}
 	var collections []map[string]interface{}
-	items, _ := data["Items"].([]interface{})
-	for _, item := range items {
+	for _, item := range itemsRaw {
 		collections = append(collections, item.(map[string]interface{}))
 	}
 	return collections
@@ -254,9 +242,12 @@ func getFirstBoxset(orignalReq *http.Request) map[string]interface{} {
 	if err != nil {
 		return nil
 	}
-	items, _ := data["Items"].([]interface{})
+	itemsRaw, ok := data["Items"].([]interface{})
+	if !ok {
+		return nil
+	}
 	var boxsets map[string]interface{}
-	for _, item := range items {
+	for _, item := range itemsRaw {
 		if item.(map[string]interface{})["CollectionType"] == "boxsets" {
 			boxsets = item.(map[string]interface{})
 			break
@@ -274,7 +265,11 @@ func ensureCollectionExist(id string, orignalReq *http.Request) bool {
 		log.Info("boxsets is nil")
 		return false
 	}
-	collectionId := boxsets["Id"].(string)
+	collectionId, ok := boxsets["Id"].(string)
+	if !ok {
+		log.Info("boxsets Id not string")
+		return false
+	}
 	collections := getAllCollections(collectionId, orignalReq)
 	if len(collections) == 0 {
 		log.Info("collections is empty")
@@ -301,7 +296,7 @@ func getCollectionDataWithApi(lib Library, apiKey string) map[string]interface{}
 	}
 	query.Set("Fields", "BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate")
 	query.Set("EnableTotalRecordCount", "true")
-	query.Set("api_key", apiKey) // 小写
+	query.Set("API_KEY", apiKey)
 
 	url := fmt.Sprintf("%s/emby/Items", config.EmbyServer)
 	headers := http.Header{}
@@ -313,7 +308,7 @@ func getCollectionDataWithApi(lib Library, apiKey string) map[string]interface{}
 	return data
 }
 
-// getItems：按库 + 请求参数聚合
+// getItems 增加 type 参数，自动根据 id 字段选择参数名
 func getItems(lib Library, orignalReq *http.Request, extQuery url.Values) map[string]interface{} {
 	orignalQuery := orignalReq.URL.Query()
 	query := url.Values{} // 避免污染原始 query
@@ -328,36 +323,26 @@ func getItems(lib Library, orignalReq *http.Request, extQuery url.Values) map[st
 	log.Debug("getItems orignalReq url query ", orignalReq.URL.Query())
 	log.Debug("getItems extQuery ", extQuery)
 
-	// 过滤掉合集/播放列表等，保留常见媒体类型
+	// 为了过滤掉非电影、电视剧、视频、游戏、音乐专辑、剧集的资源，比如合集、播放列表等，主要是以原生流派为数据源时会出现
 	query.Set("IncludeItemTypes", "Movie,Series,Video,Game,MusicAlbum,Episode")
-	if v := orignalQuery.Get("ImageTypeLimit"); v != "" {
-		query.Set("ImageTypeLimit", v)
-	} else {
-		query.Set("ImageTypeLimit", "1")
-	}
-	if v := orignalQuery.Get("Fields"); v != "" {
-		query.Set("Fields", v)
-	}
-	if v := orignalQuery.Get("EnableTotalRecordCount"); v != "" {
-		query.Set("EnableTotalRecordCount", v)
-	}
-	if v := orignalQuery.Get("Filters"); v != "" {
-		query.Set("Filters", v)
+	query.Set("ImageTypeLimit", orignalQuery.Get("ImageTypeLimit"))
+	query.Set("Fields", orignalQuery.Get("Fields"))
+	query.Set("EnableTotalRecordCount", orignalQuery.Get("EnableTotalRecordCount"))
+	if orignalQuery.Get("Filters") != "" {
+		query.Set("Filters", orignalQuery.Get("Filters"))
 	}
 	if lib.NeedRecursive() {
 		query.Set("Recursive", "true")
 	}
 	if extQuery != nil {
 		for k, v := range extQuery {
-			query.Set(k, v[0])
+			if len(v) > 0 {
+				query.Set(k, v[0])
+			}
 		}
 	} else {
-		if v := orignalQuery.Get("SortBy"); v != "" {
-			query.Set("SortBy", v)
-		}
-		if v := orignalQuery.Get("SortOrder"); v != "" {
-			query.Set("SortOrder", v)
-		}
+		query.Set("SortBy", orignalQuery.Get("SortBy"))
+		query.Set("SortOrder", orignalQuery.Get("SortOrder"))
 	}
 
 	headers := http.Header{}
@@ -376,74 +361,26 @@ func getItems(lib Library, orignalReq *http.Request, extQuery url.Values) map[st
 	if err != nil {
 		return nil
 	}
-	items, _ := data["Items"].([]interface{})
-	log.Debug("getCollectionData data count", len(items))
+	itemsRaw, ok := data["Items"].([]interface{})
+	if !ok {
+		return nil
+	}
+	log.Debug("getCollectionData data count", len(itemsRaw))
 	return data
 }
 
-// 公共：按响应的 Content-Encoding 进行重新编码
-func encodeBodyByContentEncoding(body []byte, encoding string) ([]byte, error) {
-	var buf bytes.Buffer
-	switch encoding {
-	case "gzip":
-		gz := gzip.NewWriter(&buf)
-		if _, err := gz.Write(body); err != nil {
-			return nil, err
-		}
-		gz.Close()
-		return buf.Bytes(), nil
-	case "deflate":
-		df, err := flate.NewWriter(&buf, flate.DefaultCompression)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := df.Write(body); err != nil {
-			return nil, err
-		}
-		df.Close()
-		return buf.Bytes(), nil
-	case "br":
-		br := brotli.NewWriter(&buf)
-		if _, err := br.Write(body); err != nil {
-			return nil, err
-		}
-		br.Close()
-		return buf.Bytes(), nil
-	default:
-		return body, nil // 不压缩
-	}
-}
-
-// 公共：替换响应体（先耗尽并关闭上游 body，避免连接泄露）
-func replaceBody(resp *http.Response, bodyBytes []byte) error {
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	encoding := resp.Header.Get("Content-Encoding")
-	encodedBody, err := encodeBodyByContentEncoding(bodyBytes, encoding)
-	if err != nil {
-		return err
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
-	resp.ContentLength = int64(len(encodedBody))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
-	return nil
-}
-
-// =============== image hook ===============
 func hookImage(resp *http.Response) error {
 	log.Debug("hookImage")
-	// 先取 ?tag / ?Tag；没有就从路径中提取 Items/{id}/Images/Primary 的 {id}
+	// get tag
 	tag := resp.Request.URL.Query().Get("tag")
 	if tag == "" {
 		tag = resp.Request.URL.Query().Get("Tag")
 	}
 	if tag == "" {
 		components := strings.Split(resp.Request.URL.Path, "/")
-		// /emby/Items/{id}/Images/Primary 或 /emby/Users/{uid}/Items/{id}/Images/Primary
-		// 倒数第三段是 {id}
-		if len(components) >= 3 {
-			tag = components[len(components)-3]
+		// http://192.168.33.120:8096/Items/2122802865/Images/Primary
+		if len(components) > 2 {
+			tag = components[2]
 		}
 	}
 	log.Debug("hookImage tag ", tag)
@@ -463,9 +400,11 @@ func hookImage(resp *http.Response) error {
 			return err
 		}
 		image = userImage
+		// 设置缓存响应头
 		resp.Header.Set("Cache-Control", "public, max-age=86400")
 	} else {
 		path := fmt.Sprintf("images/%s.png", lib.Name)
+		// check if file exists
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			placeholder, err := os.ReadFile("assets/placeholder.png")
 			if err != nil {
@@ -473,31 +412,34 @@ func hookImage(resp *http.Response) error {
 			}
 			image = placeholder
 		} else {
-			b, err := os.ReadFile(path)
+			var err error
+			image, err = os.ReadFile(path)
 			if err != nil {
 				return err
 			}
-			image = b
 			resp.Header.Set("Cache-Control", "public, max-age=86400")
 		}
 	}
 	contentType := http.DetectContentType(image)
-	if err := replaceBody(resp, image); err != nil {
+	encoding := resp.Header.Get("Content-Encoding")
+	encodedBody, err := encodeBodyByContentEncoding(image, encoding)
+	if err != nil {
 		return err
 	}
-	encoding := resp.Header.Get("Content-Encoding")
+	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
+	resp.ContentLength = int64(len(encodedBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
+	resp.Header.Set("Content-Type", contentType)
 	if encoding == "" {
 		resp.Header.Del("Content-Encoding")
 	} else {
 		resp.Header.Set("Content-Encoding", encoding)
 	}
-	resp.Header.Set("Content-Type", contentType)
 	resp.StatusCode = 200
 	resp.Status = "200 OK"
 	return nil
 }
 
-// =============== detail intro hook ===============
 func hookDetailIntro(resp *http.Response) error {
 	template := `{
     "Name": "Sample Library",
@@ -518,7 +460,7 @@ func hookDetailIntro(resp *http.Response) error {
     "ProviderIds": {},
     "IsFolder": true,
     "ParentId": "1",
-    "Type": "UserView",
+    "Type": "CollectionFolder",
     "UserData": {
         "PlaybackPositionTicks": 0,
         "IsFavorite": false,
@@ -543,7 +485,11 @@ func hookDetailIntro(resp *http.Response) error {
         "folders"
     ]
 }`
+	// get id after Items/
 	components := strings.Split(resp.Request.URL.Path, "/")
+	if len(components) == 0 {
+		return nil
+	}
 	id := components[len(components)-1]
 	lib, ok := libraryMap[id]
 	if !ok {
@@ -551,7 +497,8 @@ func hookDetailIntro(resp *http.Response) error {
 	}
 	log.Debug("hookDetailIntro id", id)
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(template), &data); err != nil {
+	err := json.Unmarshal([]byte(template), &data)
+	if err != nil {
 		return err
 	}
 	// 用库名和 hash id 替换
@@ -564,33 +511,35 @@ func hookDetailIntro(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	if err := replaceBody(resp, bodyBytes); err != nil {
+	encoding := resp.Header.Get("Content-Encoding")
+	encodedBody, err := encodeBodyByContentEncoding(bodyBytes, encoding)
+	if err != nil {
 		return err
 	}
-	encoding := resp.Header.Get("Content-Encoding")
+	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
+	resp.ContentLength = int64(len(encodedBody))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
 	if encoding == "" {
 		resp.Header.Del("Content-Encoding")
 	} else {
 		resp.Header.Set("Content-Encoding", encoding)
 	}
-	resp.Header.Set("Content-Type", "application/json")
 	resp.StatusCode = 200
 	resp.Status = "200 OK"
 	return nil
 }
 
-// =============== details hook（列表页） ===============
 func hookDetails(resp *http.Response) error {
 	log.Debug("hookDetails")
 	parentId := resp.Request.URL.Query().Get("ParentId")
 	lib, ok := libraryMap[parentId]
 	if !ok {
-		// 某些客户端用 Items 直接取视图，兜底走 hookViews
+		// 网易爆米花通过 Users/xxx/Items 获取数据，所以需要特殊处理
+		// 又因很多 API 都通过 Users/xxx/Items + *Id 参数获取数据，所以需要过滤掉这些 API 调用
+		// 遍历 query，如果 key 没有以 Id 结尾，则返回
 		hasId := false
 		for key := range resp.Request.URL.Query() {
-			if key == "UserId" {
-				continue
-			}
 			if strings.HasSuffix(key, "Id") {
 				hasId = true
 				break
@@ -602,24 +551,30 @@ func hookDetails(resp *http.Response) error {
 		return nil
 	}
 	bodyText := getItems(lib, resp.Request, nil)
+	if bodyText == nil {
+		return nil
+	}
 	bodyBytes, err := json.Marshal(bodyText)
 	if err != nil {
 		return err
 	}
-	if err := replaceBody(resp, bodyBytes); err != nil {
+	encoding := resp.Header.Get("Content-Encoding")
+	encodedBody, err := encodeBodyByContentEncoding(bodyBytes, encoding)
+	if err != nil {
 		return err
 	}
-	encoding := resp.Header.Get("Content-Encoding")
+	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
+	resp.ContentLength = int64(len(encodedBody))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
 	if encoding == "" {
 		resp.Header.Del("Content-Encoding")
 	} else {
 		resp.Header.Set("Content-Encoding", encoding)
 	}
-	resp.Header.Set("Content-Type", "application/json")
 	return nil
 }
 
-// =============== latest hook（最近添加） ===============
 func hookLatest(resp *http.Response) error {
 	log.Debug("hookLatest")
 	start := time.Now()
@@ -631,16 +586,21 @@ func hookLatest(resp *http.Response) error {
 	query := url.Values{}
 	query.Set("SortBy", "DateLastContentAdded,DateCreated,SortName")
 	query.Set("SortOrder", "Descending")
-	if v := resp.Request.URL.Query().Get("Limit"); v != "" {
-		query.Set("Limit", v)
-	}
+	query.Set("Limit", resp.Request.URL.Query().Get("Limit"))
 	query.Set("IsPlayed", "false")
 	if lib.NeedRecursive() {
 		query.Set("Recursive", "true")
 	}
 	log.Debug("before getCollectionData")
 	getDataStart := time.Now()
-	items := getItems(lib, resp.Request, query)["Items"].([]interface{})
+	data := getItems(lib, resp.Request, query)
+	if data == nil {
+		return nil
+	}
+	items, ok := data["Items"].([]interface{})
+	if !ok {
+		return nil
+	}
 	log.Debugf("getCollectionData done, cost: %v, items: %d", time.Since(getDataStart), len(items))
 	marshalStart := time.Now()
 	bodyBytes, err := json.Marshal(items)
@@ -648,10 +608,14 @@ func hookLatest(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	if err := replaceBody(resp, bodyBytes); err != nil {
+	encoding := resp.Header.Get("Content-Encoding")
+	encodedBody, err := encodeBodyByContentEncoding(bodyBytes, encoding)
+	if err != nil {
 		return err
 	}
-	encoding := resp.Header.Get("Content-Encoding")
+	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
+	resp.ContentLength = int64(len(encodedBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
 	if encoding == "" {
 		resp.Header.Del("Content-Encoding")
 	} else {
@@ -661,7 +625,55 @@ func hookLatest(resp *http.Response) error {
 	return nil
 }
 
-// =============== views hook（核心：视图页重排） ===============
+// ================== NEW: 视图排序函数 ==================
+
+// 根据 config.ViewsOrder 对首页视图重新排序：
+//
+// 1. 在 views_order 里的，按列表顺序排在前面
+// 2. 不在 views_order 里的，保持原有相对顺序，排在后面
+func sortViewsByConfig(items []map[string]interface{}) {
+	if len(config.ViewsOrder) == 0 {
+		return
+	}
+
+	orderIndex := make(map[string]int, len(config.ViewsOrder))
+	for i, name := range config.ViewsOrder {
+		orderIndex[name] = i
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		aName, _ := items[i]["Name"].(string)
+		bName, _ := items[j]["Name"].(string)
+
+		ai, aOK := orderIndex[aName]
+		bj, bOK := orderIndex[bName]
+
+		// 两个都在 views_order 里 -> 按配置顺序
+		if aOK && bOK {
+			return ai < bj
+		}
+		// 只有左边在 views_order 里 -> 左边优先
+		if aOK {
+			return true
+		}
+		// 只有右边在 views_order 里 -> 右边优先
+		if bOK {
+			return false
+		}
+
+		// 都不在 views_order 里：保持原来的“字母顺序 + 稳定性”
+		aSort := aName
+		if s, ok := items[i]["SortName"].(string); ok && s != "" {
+			aSort = s
+		}
+		bSort := bName
+		if s, ok := items[j]["SortName"].(string); ok && s != "" {
+			bSort = s
+		}
+		return aSort < bSort
+	})
+}
+
 func hookViews(resp *http.Response) error {
 	template := `{
 		"BackdropImageTags": [],
@@ -691,7 +703,7 @@ func hookViews(resp *http.Response) error {
 		"ServerId": "",
 		"SortName": "Sample Library",
 		"Taglines": [],
-		"Type": "UserView",
+		"Type": "CollectionFolder",
 		"UserData": {
 			"IsFavorite": false,
 			"PlaybackPositionTicks": 0,
@@ -701,8 +713,7 @@ func hookViews(resp *http.Response) error {
 	log.Debug("hookViews")
 	var bodyBytes []byte
 	var err error
-
-	// 读取上游 body（按编码）
+	log.Debug("resp.Header.Get(Content-Encoding)", resp.Header.Get("Content-Encoding"))
 	switch resp.Header.Get("Content-Encoding") {
 	case "br":
 		br := brotli.NewReader(resp.Body)
@@ -713,9 +724,10 @@ func hookViews(resp *http.Response) error {
 		bodyBytes, err = io.ReadAll(df)
 		resp.Body.Close()
 	case "gzip":
-		gz, e := gzip.NewReader(resp.Body)
-		if e != nil {
-			log.Warn("gzip.NewReader error", e)
+		gz, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			log.Warn("gzip.NewReader error", gzErr)
+			return gzErr
 		}
 		bodyBytes, err = io.ReadAll(gz)
 		if err != nil {
@@ -729,30 +741,32 @@ func hookViews(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-
 	var data map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+	err = json.Unmarshal(bodyBytes, &data)
+	if err != nil {
 		log.Warn("json.Unmarshal error", err)
-		// 解析失败则透传
 		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		return nil
 	}
-	rawItems, _ := data["Items"].([]interface{})
-	if len(rawItems) == 0 {
+	items, ok := data["Items"].([]interface{})
+	if !ok {
+		items = []interface{}{}
+	}
+	if len(items) == 0 {
 		return nil
 	}
-	typedItems := make([]map[string]interface{}, 0, len(rawItems))
-	for _, it := range rawItems {
-		typedItems = append(typedItems, it.(map[string]interface{}))
+	typedItems := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		typedItems = append(typedItems, item.(map[string]interface{}))
 	}
-	serverId := typedItems[0]["ServerId"].(string)
+	serverId, _ := typedItems[0]["ServerId"].(string)
 	log.Debug("Items count ", len(typedItems))
-
-	// 生成“虚拟库”条目
+	// 遍历 config.Library，生成 item
 	var newItems []map[string]interface{}
 	for _, lib := range config.Library {
 		var item map[string]interface{}
-		if err := json.Unmarshal([]byte(template), &item); err != nil {
+		err := json.Unmarshal([]byte(template), &item)
+		if err != nil {
 			continue
 		}
 		item["Name"] = lib.Name
@@ -765,9 +779,10 @@ func hookViews(resp *http.Response) error {
 		item["ServerId"] = serverId
 		newItems = append(newItems, item)
 	}
-
-	// 根据 Hide 过滤真实库
-	if len(config.Hide) > 0 {
+	// 根据配置决定是否合并真实库
+	if len(config.Hide) == 0 {
+		// do nothing
+	} else {
 		if slices.Contains(config.Hide, "all") {
 			typedItems = []map[string]interface{}{}
 		} else {
@@ -782,177 +797,34 @@ func hookViews(resp *http.Response) error {
 			typedItems = oldItems
 		}
 	}
+	typedItems = append(newItems, typedItems...) // 合并
 
-	// === 关键：全序控制 / 回落策略 ===
-	if len(config.ViewsOrder) > 0 {
-		typedItems = reorderViews(typedItems, newItems, config.ViewsOrder)
-	} else {
-		idx := computeInsertIndex(config.VirtualInsert, typedItems)
-		typedItems = insertMany(typedItems, idx, newItems)
-	}
+	// 新增：按 views_order 排序（如果未配置，则不动顺序）
+	sortViewsByConfig(typedItems)
 
-	// 写回
+	log.Debug("new view items count ", len(typedItems))
 	data["Items"] = typedItems
 	newBody, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
-	if err := replaceBody(resp, newBody); err != nil {
+	encoding := resp.Header.Get("Content-Encoding")
+	encodedBody, err := encodeBodyByContentEncoding(newBody, encoding)
+	if err != nil {
 		return err
 	}
-	encoding := resp.Header.Get("Content-Encoding")
+	resp.Body = io.NopCloser(bytes.NewReader(encodedBody))
+	resp.ContentLength = int64(len(encodedBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
 	if encoding == "" {
 		resp.Header.Del("Content-Encoding")
 	} else {
 		resp.Header.Set("Content-Encoding", encoding)
 	}
+
 	return nil
 }
 
-// =============== 视图重排工具（全序） ===============
-func reorderViews(real, virt []map[string]interface{}, orders []ViewOrderItem) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(real)+len(virt))
-	usedReal := make(map[string]bool) // key: real Id
-	usedVirt := make(map[string]bool) // key: lower(name)
-
-	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
-
-	appendRealType := func(t string) {
-		t = norm(t)
-		for _, r := range real {
-			id := fmt.Sprint(r["Id"])
-			if usedReal[id] {
-				continue
-			}
-			if ct, ok := r["CollectionType"].(string); ok && norm(ct) == t {
-				out = append(out, r)
-				usedReal[id] = true
-			}
-		}
-	}
-	appendRealName := func(name string) {
-		want := norm(name)
-		for _, r := range real {
-			id := fmt.Sprint(r["Id"])
-			if usedReal[id] {
-				continue
-			}
-			if rn, ok := r["Name"].(string); ok && norm(rn) == want {
-				out = append(out, r)
-				usedReal[id] = true
-				break
-			}
-		}
-	}
-	appendRealID := func(want string) {
-		want = strings.TrimSpace(want)
-		for _, r := range real {
-			id := fmt.Sprint(r["Id"])
-			if usedReal[id] {
-				continue
-			}
-			if id == want {
-				out = append(out, r)
-				usedReal[id] = true
-				break
-			}
-		}
-	}
-	appendVirtualName := func(name string) {
-		want := norm(name)
-		if usedVirt[want] {
-			return
-		}
-		for _, v := range virt {
-			vn, _ := v["Name"].(string)
-			if norm(vn) == want {
-				out = append(out, v)
-				usedVirt[want] = true
-				return
-			}
-		}
-	}
-
-	// 按 views_order 顺序逐项放置
-	for _, it := range orders {
-		switch {
-		case it.Virtual != "":
-			appendVirtualName(it.Virtual)
-		case it.RealType != "":
-			appendRealType(it.RealType)
-		case it.RealName != "":
-			appendRealName(it.RealName)
-		case it.RealID != "":
-			appendRealID(it.RealID)
-		}
-	}
-
-	// 追加剩余虚拟库（保持 newItems 原顺序）
-	for _, v := range virt {
-		vn, _ := v["Name"].(string)
-		if !usedVirt[norm(vn)] {
-			out = append(out, v)
-		}
-	}
-	// 追加剩余真实库（保持 Emby 原顺序）
-	for _, r := range real {
-		id := fmt.Sprint(r["Id"])
-		if !usedReal[id] {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// 兼容旧策略：插入工具
-func insertMany(dst []map[string]interface{}, idx int, src []map[string]interface{}) []map[string]interface{} {
-	if idx <= 0 {
-		return append(src, dst...)
-	}
-	if idx >= len(dst) {
-		return append(dst, src...)
-	}
-	out := make([]map[string]interface{}, 0, len(dst)+len(src))
-	out = append(out, dst[:idx]...)
-	out = append(out, src...)
-	out = append(out, dst[idx:]...)
-	return out
-}
-
-func computeInsertIndex(policy string, real []map[string]interface{}) int {
-	p := strings.TrimSpace(policy)
-	if p == "" || p == "prepend" {
-		return 0
-	}
-	if p == "append" {
-		return len(real)
-	}
-	if strings.HasPrefix(p, "index:") {
-		nStr := strings.TrimPrefix(p, "index:")
-		if n, err := strconv.Atoi(nStr); err == nil {
-			if n < 0 {
-				n = 0
-			}
-			if n > len(real) {
-				n = len(real)
-			}
-			return n
-		}
-		return 0
-	}
-	if strings.HasPrefix(p, "after_type:") {
-		t := strings.TrimPrefix(p, "after_type:")
-		for i, it := range real {
-			if ct, ok := it["CollectionType"].(string); ok && strings.EqualFold(ct, t) {
-				return i + 1
-			}
-		}
-		return len(real)
-	}
-	return 0
-}
-
-// =============== modifyResponse 入口 ===============
 func modifyResponse(resp *http.Response) error {
 	for _, hook := range responseHooks {
 		if hook.Pattern.MatchString(resp.Request.URL.Path) {
@@ -968,11 +840,47 @@ func modifyResponse(resp *http.Response) error {
 	return nil
 }
 
+func encodeBodyByContentEncoding(body []byte, encoding string) ([]byte, error) {
+	var buf bytes.Buffer
+	switch encoding {
+	case "gzip":
+		gz := gzip.NewWriter(&buf)
+		_, err := gz.Write(body)
+		if err != nil {
+			return nil, err
+		}
+		gz.Close()
+		return buf.Bytes(), nil
+	case "deflate":
+		df, err := flate.NewWriter(&buf, flate.DefaultCompression)
+		if err != nil {
+			return nil, err
+		}
+		_, err = df.Write(body)
+		if err != nil {
+			return nil, err
+		}
+		df.Close()
+		return buf.Bytes(), nil
+	case "br":
+		br := brotli.NewWriter(&buf)
+		_, err := br.Write(body)
+		if err != nil {
+			return nil, err
+		}
+		br.Close()
+		return buf.Bytes(), nil
+	default:
+		return body, nil // 不压缩
+	}
+}
+
 func getImage(lib *Library) error {
 	alreadyGenerated := false
 	err := badgerDB.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(lib.Name))
 		if err != nil {
+			// 只在不是not found时打印
 			if err != badger.ErrKeyNotFound {
 				log.Warn("badgerDB.View error", err)
 			}
@@ -998,10 +906,12 @@ func getImage(lib *Library) error {
 
 	data := getCollectionDataWithApi(*lib, config.EmbyApiKey)
 	if data == nil {
-		log.Debug("no data for cover gen", lib.Name)
 		return nil
 	}
-	items, _ := data["Items"].([]interface{})
+	items, ok := data["Items"].([]interface{})
+	if !ok {
+		return nil
+	}
 	itemCount := len(items)
 	if itemCount == 0 {
 		log.Debug("no available image", lib.Name)
@@ -1012,11 +922,10 @@ func getImage(lib *Library) error {
 	if itemCount <= 9 {
 		selected = items
 	} else {
+		// 洗牌
 		rand.Shuffle(itemCount, func(i, j int) { items[i], items[j] = items[j], items[i] })
 		selected = items[:9]
 	}
-
-	httpClient := &http.Client{Timeout: 12 * time.Second}
 
 	for i, itemRaw := range selected {
 		item := itemRaw.(map[string]interface{})
@@ -1032,36 +941,36 @@ func getImage(lib *Library) error {
 		if !ok {
 			continue
 		}
-		imageUrl := fmt.Sprintf("%s/emby/Items/%s/Images/Primary?maxHeight=600&maxWidth=400&tag=%s&quality=90&api_key=%s",
-			config.EmbyServer, itemId, imageId, url.QueryEscape(config.EmbyApiKey))
-		req, _ := http.NewRequest("GET", imageUrl, nil)
-		resp, err := httpClient.Do(req)
+		imageUrl := fmt.Sprintf("%s/emby/Items/%s/Images/Primary?maxHeight=600&maxWidth=400&tag=%s&quality=90", config.EmbyServer, itemId, imageId)
+		image, err := http.Get(imageUrl)
 		if err != nil {
 			return err
 		}
-		imageBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		imageBytes, err := io.ReadAll(image.Body)
+		image.Body.Close()
 		if err != nil {
 			return err
 		}
-		_ = os.MkdirAll(fmt.Sprintf("images/%s", lib.Name), 0755)
-		if err := os.WriteFile(fmt.Sprintf("images/%s/%d.jpg", lib.Name, i+1), imageBytes, 0644); err != nil {
+		os.MkdirAll(fmt.Sprintf("images/%s", lib.Name), 0755)
+		err = os.WriteFile(fmt.Sprintf("images/%s/%d.jpg", lib.Name, i+1), imageBytes, 0644)
+		if err != nil {
 			return err
 		}
 	}
-	// 生成拼图
+	// uv run python gen.py
 	cmd := exec.Command("uv", "run", "python", "cover_gen.py", lib.Name)
 	cmd.Dir = "."
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	err = cmd.Run()
+	if err != nil {
 		return err
 	}
 
 	_ = badgerDB.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(lib.Name), []byte("1"))
 	})
-	return nil
+	return err
 }
 
 func main() {
@@ -1107,13 +1016,7 @@ func main() {
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
-	// 上游 Transport：禁用透明解压，由我们手动按 Content-Encoding 处理
-	proxy.Transport = &http.Transport{
-		Proxy:              http.ProxyFromEnvironment,
-		DisableCompression: true,
-	}
-
-	// 修改 Director 保证 Host 头正确，并补充转发头
+	// 修改 Director 保证 Host 头正确
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -1133,16 +1036,15 @@ func main() {
 			req.Header.Set("X-Real-IP", clientIP)
 		}
 
-		// X-Forwarded-Proto / Protocol
+		// X-Forwarded-Protocol
 		scheme := "http"
 		if req.TLS != nil {
 			scheme = "https"
 		}
-		req.Header.Set("X-Forwarded-Proto", scheme)
 		req.Header.Set("X-Forwarded-Protocol", scheme)
 	}
 
-	// 修改响应，处理重定向 / 注入视图
+	// 修改响应，处理重定向
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		return modifyResponse(resp)
 	}
@@ -1151,18 +1053,17 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
-	// 异步获取封面图
+	// 异步获取图片
 	for _, lib := range config.Library {
 		libCopy := lib // 防止闭包变量问题
 		go func(l Library) {
-			if err := getImage(&l); err != nil {
+			err := getImage(&l)
+			if err != nil {
 				log.Warn("getImage error", err)
 			}
 		}(libCopy)
 	}
 
 	log.Info("emby-virtual-lib listen on :8000")
-	if err := http.ListenAndServe(":8000", nil); err != nil {
-		log.Fatal(err)
-	}
+	_ = http.ListenAndServe(":8000", nil)
 }
